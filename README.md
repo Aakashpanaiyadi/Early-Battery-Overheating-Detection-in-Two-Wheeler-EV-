@@ -3,7 +3,7 @@
 # Early Battery Overheating Detection in Two-Wheeler EV 
 
 ##  Project Introduction
-
+This project is an early-warning diagnostic system designed to detect battery overheating in electric two-wheelers before it happens. While traditional systems only react after a battery gets hot, this solution runs a live electric scooter simulation on an ESP32 to predict thermal stress. By monitoring riding patterns (like aggressive acceleration) and estimating rider weight in real time, it catches rapid temperature rises early and sends live alerts to a dashboard before any battery damage occurs
 
 ---
 
