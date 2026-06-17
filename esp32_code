@@ -1,0 +1,805 @@
+#include <Arduino.h>
+#include <string.h>
+#include <math.h>
+#define PIN_THROTTLE   34
+#define PIN_LOAD       35
+#define PIN_TAMB       32
+
+const float PACK_V_NOM        = 52.0f;
+const float PACK_V_FULL       = 58.8f;
+const float PACK_V_CUTOFF     = 42.0f;
+const float PACK_V_LIMP_THR   = 44.0f;
+const float PACK_Q_AH         = 67.3f;
+const float PACK_Q_AS         = PACK_Q_AH * 3600.0f;
+
+const float PACK_I_ECO_MAX    = 45.0f;
+const float PACK_I_PWR_MAX    = 125.0f;
+
+const float REGEN_TORQUE_MAX  = 25.0f;
+const float REGEN_I_MAX       = 30.0f;
+const float REGEN_MIN_SPD_KMH = 8.0f;
+const float REGEN_SOC_LIMIT   = 0.97f;
+const float REGEN_SPD_MARGIN  = 5.0f;
+const float REGEN_FADE_RANGE  = 8.0f;
+
+const float C_RATE_LAUNCH_PK  = 1.85f;
+const float C_RATE_ACCEL      = 1.10f;
+const float C_RATE_CRUISE     = 0.85f;
+
+const int   CELL_S     = 14;
+const int   CELL_P     = 14;
+const float CELL_V_NOM = 3.70f;
+const float CELL_Q_AH  = PACK_Q_AH / (float)CELL_P;
+const float CELL_Q_AS  = CELL_Q_AH * 3600.0f;
+
+const float MOTOR_KT   = 1.18f;
+const float WHEEL_R    = 0.24f;
+
+const float VEH_M_BASE = 118.0f;
+const float VEH_MR     = 3.5f;
+
+const float RHO_AIR    = 1.2f;
+const float CD_AF      = 0.68f;
+const float CRR        = 0.018f;
+const float G          = 9.81f;
+
+const float TOP_SPEED_PWR     = 78.0f;
+const float TOP_SPEED_ECO     = 45.0f;
+const float TOP_SPEED_PILLION = 78.0f;
+const float PILLION_MASS_THR  = 110.0f;
+
+const float T_THROTTLE        = 45.0f;
+const float T_CRITICAL_LO     = 55.0f;
+const float T_CRITICAL_HI     = 60.0f;
+const float BAT_MASS_KG       = 18.0f;
+const float BAT_CP            = 900.0f;
+const float BAT_THERMAL_C     = BAT_MASS_KG * BAT_CP;
+const float BAT_UA            = 2.2f;
+const float BAT_UA_SPEED_GAIN = 0.15f;
+
+const float BASE_TAU            = 0.35f;
+const float THROTTLE_FILTER_TAU = 1.5f;
+const float TORQUE_RAMP_RATE    = 200.0f;
+const float BOOST_DURATION      = 0.4f;
+const float BOOST_MULTIPLIER    = 1.25f;
+const float BOOST_THROTTLE_RATE = 250.0f;
+
+const float TS = 0.1f;
+
+const int   BSAD_WINDOW    = 600;
+const int   CONF_WINDOWS   = 5;
+const int   PAYLOAD_WINDOW = 3000;
+const float MAX_PAYLOAD    = 120.0f;
+#define     SS_BUF_MAX     3000
+
+const int LUT_N = 11;
+const float SOC_PTS[LUT_N] = {0.0f,0.1f,0.2f,0.3f,0.4f,0.5f,
+                               0.6f,0.7f,0.8f,0.9f,1.0f};
+const float OCV_PTS[LUT_N] = {3.00f,3.22f,3.42f,3.56f,3.65f,3.71f,
+                               3.78f,3.87f,3.97f,4.10f,4.20f};
+const float R0_PTS[LUT_N]  = {0.01750f,0.01375f,0.01050f,0.00875f,0.00750f,0.00675f,
+                               0.00625f,0.00625f,0.00650f,0.00700f,0.00800f};
+const float R1_PTS[LUT_N]  = {0.01000f,0.00750f,0.00550f,0.00425f,0.00350f,0.00300f,
+                               0.00275f,0.00250f,0.00275f,0.00300f,0.00375f};
+const float R2_PTS[LUT_N]  = {0.00750f,0.00550f,0.00400f,0.00300f,0.00250f,0.00200f,
+                               0.00175f,0.00175f,0.00200f,0.00225f,0.00300f};
+const float C1_PTS[LUT_N]  = {3200.f,5200.f,7200.f,8800.f,10400.f,11600.f,
+                               12400.f,12800.f,12000.f,10800.f,9600.f};
+const float C2_PTS[LUT_N]  = {14000.f,28000.f,42000.f,54000.f,62000.f,68000.f,
+                               72000.f,70000.f,66000.f,60000.f,52000.f};
+struct SimState {
+    float SOC;
+    float V1, V2;
+    float V_cell, V_pack;
+    float P_bat;
+    float v_ms;
+    float filtered_throttle;
+    float last_throttle;
+    float torque_cmd;
+    float boost_timer;
+    float dist_m;
+    float acc;
+    float v_prev;
+    float T_bat;
+    float Q_gen, Q_cool;
+    float C_rate;
+    float V_sag;
+    float F_drag, F_roll, F_tractive;
+    float total_mass;
+    float I_pack;
+    float t;
+    bool  is_aggressive;
+    bool  limp_home;
+    bool  regen_active;
+    float regen_torque;
+};
+
+struct BsadSample {
+    float throttle_pct;
+    float speed_kmh;
+    float current_A;
+    float power_W;
+    float temp_C;
+};
+
+struct Features {
+    float throttle_std;
+    float accel_above3_pct;
+    float speed_mean;
+    float speed_above60_pct;
+    float throttle_transitions;
+    float current_std;
+    float throttle_above80_pct;
+    float zero_throttle_frac;
+    float on_off_score;
+    float power_std;
+    float accel_mean_pos;
+    float accel_efficiency;
+    float peak_current;
+    float temp_rise_per_min;
+};
+
+SimState sim;
+
+static BsadSample bsad_buf[BSAD_WINDOW];
+static int  bsad_buf_head         = 0;
+static int  bsad_buf_count        = 0;
+static int  bsad_sample_in_window = 0;
+
+static float cumulative_AA  = 0.0f;
+static float cumulative_SHS = 0.0f;
+static int   window_count   = 0;
+static float last_AA_conf   = 0.0f;
+static float last_SHS_conf  = 0.0f;
+static char  last_dominant[4] = "";
+static float last_dom_conf  = 0.0f;
+static bool  bsad_ready     = false;
+
+static float ss_I_buf[SS_BUF_MAX];
+static float ss_v_buf[SS_BUF_MAX];
+static int   ss_count         = 0;
+static float payload_kg       = 0.0f;
+static float payload_pct      = 0.0f;
+static bool  overload_flag    = false;
+static bool  payload_ready    = false;
+
+static int   payload_sample_count = 0;
+static float temp_window_start    = -1.0f;
+static float temp_window_end      = 0.0f;
+
+static float _t[BSAD_WINDOW];
+static float _s[BSAD_WINDOW];
+static float _c[BSAD_WINDOW];
+static float _p[BSAD_WINDOW];
+static float _tmp[BSAD_WINDOW];
+static float _accel[BSAD_WINDOW];       
+static float _accel_pos[BSAD_WINDOW];
+
+float lut(float soc, const float* table) {
+    if (soc <= 0.0f) return table[0];
+    if (soc >= 1.0f) return table[LUT_N - 1];
+    for (int i = 0; i < LUT_N - 1; i++) {
+        if (soc <= SOC_PTS[i + 1]) {
+            float t = (soc - SOC_PTS[i]) / (SOC_PTS[i + 1] - SOC_PTS[i]);
+            return table[i] + t * (table[i + 1] - table[i]);
+        }
+    }
+    return table[LUT_N - 1];
+}
+
+float target_c_rate(float speed_kmh, float throttle_pct, bool eco_mode) {
+    float thr = throttle_pct / 100.0f;
+    if (eco_mode) return 0.67f * thr;
+    float c_peak;
+    if (speed_kmh < 40.0f) {
+        float frac = speed_kmh / 40.0f;
+        c_peak = 1.30f + (C_RATE_LAUNCH_PK - 1.30f) * frac;
+    } else if (speed_kmh < 70.0f) {
+        float frac = (speed_kmh - 40.0f) / 30.0f;
+        c_peak = C_RATE_LAUNCH_PK + (C_RATE_ACCEL - C_RATE_LAUNCH_PK) * frac;
+    } else {
+        c_peak = C_RATE_CRUISE;
+    }
+    return c_peak * thr;
+}
+
+void sim_reset(float T_amb) {
+    sim.SOC               = 1.0f;
+    sim.V1                = 0.0f;
+    sim.V2                = 0.0f;
+    sim.V_cell            = CELL_V_NOM;
+    sim.V_pack            = PACK_V_NOM;
+    sim.P_bat             = 0.0f;
+    sim.v_ms              = 0.0f;
+    sim.filtered_throttle = 0.0f;
+    sim.last_throttle     = 0.0f;
+    sim.torque_cmd        = 0.0f;
+    sim.boost_timer       = 0.0f;
+    sim.dist_m            = 0.0f;
+    sim.acc               = 0.0f;
+    sim.v_prev            = 0.0f;
+    sim.T_bat             = T_amb;
+    sim.Q_gen             = 0.0f;
+    sim.Q_cool            = 0.0f;
+    sim.C_rate            = 0.0f;
+    sim.V_sag             = 0.0f;
+    sim.F_drag            = 0.0f;
+    sim.F_roll            = 0.0f;
+    sim.F_tractive        = 0.0f;
+    sim.total_mass        = 0.0f;
+    sim.I_pack            = 0.0f;
+    sim.t                 = 0.0f;
+    sim.is_aggressive     = false;
+    sim.limp_home         = false;
+    sim.regen_active      = false;
+    sim.regen_torque      = 0.0f;
+}
+
+void sim_step(float throttle_pct, float T_amb, float rider_kg, bool eco_mode) {
+    sim.t += TS;
+
+    bool  is_pillion  = (rider_kg >= PILLION_MASS_THR);
+    float top_spd_kmh;
+    if (is_pillion)     top_spd_kmh = TOP_SPEED_PILLION;
+    else if (eco_mode)  top_spd_kmh = TOP_SPEED_ECO;
+    else                top_spd_kmh = TOP_SPEED_PWR;
+    float top_spd_ms = top_spd_kmh / 3.6f;
+
+    float tau        = BASE_TAU * (is_pillion ? 1.35f : 1.0f);
+    float total_mass = VEH_M_BASE + rider_kg + VEH_MR;
+    sim.total_mass   = total_mass;
+
+    float throttle_rate   = (throttle_pct - sim.last_throttle) / TS;
+    sim.last_throttle     = throttle_pct;
+
+    if (throttle_rate > BOOST_THROTTLE_RATE) {
+        sim.boost_timer   = BOOST_DURATION;
+        sim.is_aggressive = true;
+    } else {
+        sim.is_aggressive = false;
+    }
+
+    sim.filtered_throttle += ((throttle_pct - sim.filtered_throttle) / THROTTLE_FILTER_TAU) * TS;
+
+    float speed_kmh   = sim.v_ms * 3.6f;
+    float i_max_crate = target_c_rate(speed_kmh, sim.filtered_throttle, eco_mode) * PACK_Q_AH;
+    float i_max_hard  = eco_mode ? PACK_I_ECO_MAX : PACK_I_PWR_MAX;
+    float i_max       = (i_max_crate < i_max_hard) ? i_max_crate : i_max_hard;
+
+    float I_pack = 0.0f;
+
+    if (throttle_pct < 2.0f) {
+        bool is_regen_eligible = (speed_kmh > REGEN_MIN_SPD_KMH) && (sim.SOC < REGEN_SOC_LIMIT);
+        if (is_regen_eligible) {
+            sim.torque_cmd  = -REGEN_TORQUE_MAX;
+            sim.F_drag      = 0.5f * RHO_AIR * CD_AF * sim.v_ms * sim.v_ms;
+            sim.F_roll      = CRR * total_mass * G;
+            float total_decel = fabsf(sim.torque_cmd / WHEEL_R) + sim.F_drag + sim.F_roll;
+            sim.acc  = -total_decel / total_mass;
+            sim.v_ms = fmaxf(0.0f, sim.v_ms + sim.acc * TS);
+            float I_gen = (sim.torque_cmd / MOTOR_KT) * 0.85f;
+            I_pack = fmaxf(-REGEN_I_MAX, I_gen);
+        } else {
+            sim.torque_cmd = 0.0f;
+            sim.F_drag     = 0.5f * RHO_AIR * CD_AF * sim.v_ms * sim.v_ms;
+            sim.F_roll     = (sim.v_ms > 0.05f) ? (CRR * total_mass * G) : 0.0f;
+            sim.acc  = -(sim.F_drag + sim.F_roll) / total_mass;
+            sim.v_ms = fmaxf(0.0f, sim.v_ms + sim.acc * TS);
+            I_pack   = 0.0f;
+        }
+    } else {
+        float v_ref = (sim.filtered_throttle / 100.0f) * top_spd_ms;
+        sim.F_drag  = 0.5f * RHO_AIR * CD_AF * sim.v_ms * sim.v_ms;
+        sim.F_roll  = CRR * total_mass * G;
+        float T_hold    = (sim.F_drag + sim.F_roll) * WHEEL_R;
+        float speed_err = v_ref - sim.v_ms;
+        float T_control = (total_mass * speed_err / tau) * WHEEL_R;
+        float T_req     = T_hold + T_control;
+
+        if (sim.boost_timer > 0.0f) {
+            T_req           *= BOOST_MULTIPLIER;
+            sim.boost_timer -= TS;
+        }
+
+        float ms    = TORQUE_RAMP_RATE * TS;
+        float delta = T_req - sim.torque_cmd;
+        if (delta >  ms) delta =  ms;
+        if (delta < -ms) delta = -ms;
+        sim.torque_cmd += delta;
+
+        float I_req = sim.torque_cmd / MOTOR_KT;
+        if (I_req >= 0.0f) {
+            I_pack = fminf(i_max, I_req);
+        } else {
+            if (sim.SOC >= REGEN_SOC_LIMIT || sim.V_pack >= PACK_V_FULL)
+                I_pack = 0.0f;
+            else
+                I_pack = fmaxf(-REGEN_I_MAX, I_req);
+        }
+
+        float actual_F = (I_pack * MOTOR_KT) / WHEEL_R;
+        sim.acc  = (actual_F - sim.F_drag - sim.F_roll) / total_mass;
+        sim.v_ms = fmaxf(0.0f, fminf(top_spd_ms, sim.v_ms + sim.acc * TS));
+    }
+
+    sim.F_tractive = sim.torque_cmd / WHEEL_R;
+
+    if (sim.T_bat > T_THROTTLE) {
+        float factor = 1.0f - (sim.T_bat - T_THROTTLE) / (T_CRITICAL_LO - T_THROTTLE);
+        if (factor < 0.0f) factor = 0.0f;
+        if (factor > 1.0f) factor = 1.0f;
+        I_pack *= factor;
+    }
+    if (sim.T_bat >= T_CRITICAL_HI) I_pack = 0.0f;
+
+    float I_cell = I_pack / (float)CELL_P;
+    float soc    = sim.SOC;
+
+    float R0  = lut(soc, R0_PTS);
+    float R1  = lut(soc, R1_PTS);
+    float C1  = lut(soc, C1_PTS);
+    float R2  = lut(soc, R2_PTS);
+    float C2  = lut(soc, C2_PTS);
+    float OCV = lut(soc, OCV_PTS);
+
+    sim.V1 += TS * (-sim.V1 / (R1 * C1) + I_cell / C1);
+    sim.V2 += TS * (-sim.V2 / (R2 * C2) + I_cell / C2);
+
+    sim.SOC    = fmaxf(0.0f, fminf(1.0f, sim.SOC - (I_cell / CELL_Q_AS) * TS));
+    sim.V_cell = OCV - R0 * I_cell - sim.V1 - sim.V2;
+    sim.V_pack = sim.V_cell * (float)CELL_S;
+
+    float V_resting = OCV * (float)CELL_S;
+    sim.V_sag       = V_resting - sim.V_pack;
+
+    if (sim.V_pack < PACK_V_LIMP_THR)
+        sim.limp_home = true;
+    else if (sim.V_pack > PACK_V_LIMP_THR + 1.0f)
+        sim.limp_home = false;
+
+    if (sim.limp_home) {
+        float I_limit = (eco_mode ? PACK_I_ECO_MAX : PACK_I_PWR_MAX) * 0.50f;
+        if (I_pack > I_limit) I_pack = I_limit;
+        I_cell     = I_pack / (float)CELL_P;
+        sim.V_cell = OCV - R0 * I_cell - sim.V1 - sim.V2;
+        sim.V_pack = sim.V_cell * (float)CELL_S;
+        sim.V_sag  = V_resting - sim.V_pack;
+    }
+
+    sim.P_bat  = sim.V_pack * I_pack;
+    sim.v_prev = sim.v_ms;
+    sim.dist_m += sim.v_ms * TS;
+    sim.C_rate = I_pack / PACK_Q_AH;
+    sim.I_pack = I_pack;
+
+    sim.regen_active = (I_pack < 0.0f);
+    sim.regen_torque = (I_pack < 0.0f) ? sim.torque_cmd : 0.0f;
+
+    float R_pack_thm = R0 * (float)CELL_S / (float)CELL_P;
+    if (R_pack_thm < 0.03f) R_pack_thm = 0.03f;
+    if (R_pack_thm > 0.06f) R_pack_thm = 0.06f;
+    float UA     = BAT_UA + BAT_UA_SPEED_GAIN * (sim.v_ms * 3.6f);
+    sim.Q_gen  = I_pack * I_pack * R_pack_thm;
+    sim.Q_cool = UA * (sim.T_bat - T_amb);
+    float dT   = ((sim.Q_gen - sim.Q_cool) / BAT_THERMAL_C) * TS;
+    sim.T_bat  = fminf(90.0f, sim.T_bat + dT);
+}
+
+float read_throttle() {
+    int raw = analogRead(PIN_THROTTLE);
+    return (raw / 4095.0f) * 100.0f;
+}
+float read_load() {
+    int raw = analogRead(PIN_LOAD);
+    return 40.0f + (raw / 4095.0f) * 110.0f;
+}
+float read_tamb() {
+    int raw = analogRead(PIN_TAMB);
+    return 30.0f + (raw / 4095.0f) * 20.0f;
+}
+
+static float std_dev(const float* arr, int n) {
+    if (n <= 0) return 0.0f;
+    float sum = 0.0f;
+    for (int i = 0; i < n; i++) sum += arr[i];
+    float mean = sum / (float)n;
+    float var  = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float d = arr[i] - mean;
+        var += d * d;
+    }
+    return sqrtf(var / (float)n);
+}
+
+static float arr_mean(const float* arr, int n) {
+    if (n <= 0) return 0.0f;
+    float s = 0.0f;
+    for (int i = 0; i < n; i++) s += arr[i];
+    return s / (float)n;
+}
+
+static float arr_max(const float* arr, int n) {
+    if (n <= 0) return 0.0f;
+    float m = arr[0];
+    for (int i = 1; i < n; i++) if (arr[i] > m) m = arr[i];
+    return m;
+}
+
+static float median_of(float* arr, int n) {
+    
+    for (int i = 1; i < n; i++) {
+        float key = arr[i];
+        int   j   = i - 1;
+        while (j >= 0 && arr[j] > key) {
+            arr[j + 1] = arr[j];
+            j--;
+        }
+        arr[j + 1] = key;
+    }
+    if (n % 2 == 0) return (arr[n / 2 - 1] + arr[n / 2]) * 0.5f;
+    return arr[n / 2];
+}
+
+static Features extract_features() {
+    int n = BSAD_WINDOW;
+
+    
+    for (int i = 0; i < n; i++) {
+        int idx  = (bsad_buf_head + i) % BSAD_WINDOW;
+        _t[i]   = bsad_buf[idx].throttle_pct;
+        _s[i]   = bsad_buf[idx].speed_kmh;
+        _c[i]   = bsad_buf[idx].current_A;
+        _p[i]   = bsad_buf[idx].power_W;
+        _tmp[i] = bsad_buf[idx].temp_C;
+    }
+
+    
+    int n_accel = n - 1;
+    int n_pos   = 0;
+    for (int i = 0; i < n_accel; i++) {
+        _accel[i] = (_s[i + 1] - _s[i]) / 0.1f;
+        if (_accel[i] > 0.0f) _accel_pos[n_pos++] = _accel[i];
+    }
+
+    
+    float transitions = 0.0f;
+    for (int i = 0; i < n - 1; i++)
+        if (fabsf(_t[i + 1] - _t[i]) > 10.0f) transitions += 1.0f;
+
+    
+    float accel_above3 = 0.0f;
+    for (int i = 0; i < n_accel; i++)
+        if (_accel[i] > 3.0f) accel_above3 += 1.0f;
+    accel_above3 = (accel_above3 / (float)n_accel) * 100.0f;
+
+    
+    float spd60 = 0.0f;
+    for (int i = 0; i < n; i++) if (_s[i] > 60.0f) spd60 += 1.0f;
+    spd60 = (spd60 / (float)n) * 100.0f;
+
+    
+    float thr80 = 0.0f;
+    for (int i = 0; i < n; i++) if (_t[i] > 80.0f) thr80 += 1.0f;
+    thr80 = (thr80 / (float)n) * 100.0f;
+
+    
+    float ztf = 0.0f;
+    for (int i = 0; i < n; i++) if (_t[i] < 5.0f) ztf += 1.0f;
+    ztf = (ztf / (float)n) * 100.0f;
+
+    float on_off    = (thr80 / 100.0f) * (ztf / 100.0f) * 100.0f;
+    float amp       = (n_pos > 0) ? arr_mean(_accel_pos, n_pos) : 0.0f;
+    float ae        = accel_above3 / (transitions + 1.0f);
+    float temp_rise = (_tmp[n - 1] - _tmp[0]) / ((float)n * 0.1f / 60.0f);
+
+    Features f;
+    f.throttle_std         = std_dev(_t, n);
+    f.accel_above3_pct     = accel_above3;
+    f.speed_mean           = arr_mean(_s, n);
+    f.speed_above60_pct    = spd60;
+    f.throttle_transitions = transitions;
+    f.current_std          = std_dev(_c, n);
+    f.throttle_above80_pct = thr80;
+    f.zero_throttle_frac   = ztf;
+    f.on_off_score         = on_off;
+    f.power_std            = std_dev(_p, n);
+    f.accel_mean_pos       = amp;
+    f.accel_efficiency     = ae;
+    f.peak_current         = arr_max(_c, n);
+    f.temp_rise_per_min    = temp_rise;
+    return f;
+}
+
+static void diagnose_window(const Features& f, float& score_AA, float& score_SHS) {
+    score_AA  = 0.0f;
+    score_SHS = 0.0f;
+
+    if (f.temp_rise_per_min < 0.05f) return;
+
+    float thr_std = f.throttle_std;
+    float amp     = f.accel_mean_pos;
+    float ae      = f.accel_efficiency;
+
+    
+    if      (thr_std < 1.5f) score_SHS += 3.0f;
+    else if (thr_std < 3.0f) score_SHS += 2.0f;
+
+    float spd60 = f.speed_above60_pct;
+    if      (spd60 > 50.0f) score_SHS += 3.0f;
+    else if (spd60 > 25.0f) score_SHS += 2.0f;
+    else if (spd60 > 10.0f) score_SHS += 1.0f;
+
+    float thr80 = f.throttle_above80_pct;
+    if      (thr80 > 50.0f) score_SHS += 3.0f;
+    else if (thr80 > 20.0f) score_SHS += 2.0f;
+    else if (thr80 > 10.0f) score_SHS += 1.0f;
+
+    if      (amp < 0.3f) score_SHS += 3.0f;
+    else if (amp < 0.8f) score_SHS += 2.0f;
+    else if (amp < 1.5f) score_SHS += 1.0f;
+
+    float ps = f.power_std;
+    if      (ps < 150.0f) score_SHS += 3.0f;
+    else if (ps < 400.0f) score_SHS += 2.0f;
+    else if (ps < 800.0f) score_SHS += 1.0f;
+
+    if (f.zero_throttle_frac < 2.0f) score_SHS += 1.0f;
+
+    
+    float a3 = f.accel_above3_pct;
+    if      (a3 > 15.0f) score_AA += 3.0f;
+    else if (a3 >  7.0f) score_AA += 2.0f;
+    else if (a3 >  2.0f) score_AA += 1.0f;
+
+    if      (ae > 10.0f)  score_AA += 3.0f;
+    else if (ae >  4.0f)  score_AA += 2.0f;
+    else if (ae >  1.5f)  score_AA += 1.0f;
+
+    float cs = f.current_std;
+    if      (cs > 35.0f) score_AA += 3.0f;
+    else if (cs > 20.0f) score_AA += 2.0f;
+    else if (cs > 10.0f) score_AA += 1.0f;
+
+    float pc = f.peak_current;
+    if      (pc > 90.0f) score_AA += 3.0f;
+    else if (pc > 70.0f) score_AA += 2.0f;
+    else if (pc > 50.0f) score_AA += 1.0f;
+
+    if      (amp > 2.5f) score_AA += 2.0f;
+    else if (amp > 1.5f) score_AA += 1.0f;
+
+    if (f.on_off_score < 1.0f) score_AA += 1.0f;
+}
+
+static void generate_bsad_report() {
+    float total = cumulative_AA + cumulative_SHS;
+    if (total == 0.0f) return;
+
+    last_AA_conf  = (cumulative_AA  / total) * 100.0f;
+    last_SHS_conf = (cumulative_SHS / total) * 100.0f;
+
+    if (last_AA_conf >= last_SHS_conf) {
+        strncpy(last_dominant, "AA",  sizeof(last_dominant));
+        last_dom_conf = last_AA_conf;
+    } else {
+        strncpy(last_dominant, "SHS", sizeof(last_dominant));
+        last_dom_conf = last_SHS_conf;
+    }
+
+    bsad_ready = true;
+}
+
+static void evaluate_payload() {
+    if (ss_count < 10) {
+        payload_ready = true;
+        return;
+    }
+
+    
+    static float tmp_I[SS_BUF_MAX];
+    static float tmp_v[SS_BUF_MAX];
+    int n = (ss_count < SS_BUF_MAX) ? ss_count : SS_BUF_MAX;
+    for (int i = 0; i < n; i++) {
+        tmp_I[i] = ss_I_buf[i];
+        tmp_v[i] = ss_v_buf[i];
+    }
+
+    float I_median = median_of(tmp_I, n);
+    float v_median = median_of(tmp_v, n);
+
+    float T_motor = MOTOR_KT * I_median;
+    float F_motor = T_motor / WHEEL_R;
+    float F_drag  = 0.5f * RHO_AIR * CD_AF * (v_median * v_median);
+    float F_net   = F_motor - F_drag;
+
+    if (F_net <= 0.0f) {
+        payload_ready = true;
+        return;
+    }
+
+    float m_est = F_net / (CRR * G);
+    float pload = m_est - VEH_M_BASE;
+    if (pload < 0.0f) pload = 0.0f;
+
+    payload_kg    = pload;
+    payload_pct   = (pload / MAX_PAYLOAD) * 100.0f;
+    overload_flag = (pload > MAX_PAYLOAD);
+    payload_ready = true;
+}
+
+static void print_combined_result(float temp_rise) {
+    Serial.println(F("========== 5-MINUTE DIAGNOSIS REPORT =========="));
+    Serial.print(F("AA  confidence : ")); Serial.print(last_AA_conf,  1); Serial.println('%');
+    Serial.print(F("SHS confidence : ")); Serial.print(last_SHS_conf, 1); Serial.println('%');
+    Serial.print(F("Dominant       : "));
+    if (strlen(last_dominant) > 0) {
+        Serial.print(last_dominant);
+        Serial.print(F(" ("));
+        Serial.print(last_dom_conf, 1);
+        Serial.println(F("%)"));
+    } else {
+        Serial.println(F("No dominant pattern"));
+    }
+    Serial.print(F("Payload est.   : ")); Serial.print(payload_kg,  1); Serial.println(F(" kg"));
+    Serial.print(F("Payload %      : ")); Serial.print(payload_pct, 1); Serial.println('%');
+    Serial.print(F("Overload       : ")); Serial.println(overload_flag ? F("YES") : F("NO"));
+
+    Serial.print(F("Combined result: "));
+    if (strlen(last_dominant) > 0) {
+        if (overload_flag) Serial.print(F("Overload + "));
+        if (strcmp(last_dominant, "AA") == 0)
+            Serial.println(F("Aggressive Acceleration"));
+        else
+            Serial.println(F("Sustained High Speed"));
+    } else {
+        Serial.println(F("No dominant pattern"));
+    }
+
+    Serial.print(F("Thermal        : "));
+    if (strcmp(last_dominant, "SHS") == 0 && temp_rise >= 0.4f) {
+        Serial.print(F("ADVISORY - SHS elevating battery temp (dT="));
+        Serial.print(temp_rise, 2); Serial.println(F(" C/5min)"));
+    } else if (strcmp(last_dominant, "AA") == 0 && temp_rise >= 0.6f) {
+        Serial.print(F("WARNING  - AA heating battery (dT="));
+        Serial.print(temp_rise, 2); Serial.println(F(" C/5min)"));
+    } else {
+        Serial.print(F("Normal range (dT="));
+        Serial.print(temp_rise, 2); Serial.println(F(" C/5min)"));
+    }
+    Serial.println(F("================================================"));
+}
+
+static void diagnoser_feed(float throttle_pct, float speed_kmh,
+                            float current_A,    float power_W,
+                            float temp_C) {
+
+    
+    int write_idx = (bsad_buf_head + bsad_buf_count) % BSAD_WINDOW;
+    if (bsad_buf_count < BSAD_WINDOW) {
+        bsad_buf_count++;
+    } else {
+        bsad_buf_head = (bsad_buf_head + 1) % BSAD_WINDOW;
+        write_idx     = (bsad_buf_head + BSAD_WINDOW - 1) % BSAD_WINDOW;
+    }
+    bsad_buf[write_idx].throttle_pct = throttle_pct;
+    bsad_buf[write_idx].speed_kmh    = speed_kmh;
+    bsad_buf[write_idx].current_A    = current_A;
+    bsad_buf[write_idx].power_W      = power_W;
+    bsad_buf[write_idx].temp_C       = temp_C;
+
+    
+    bsad_sample_in_window++;
+    if (bsad_sample_in_window >= BSAD_WINDOW) {
+        Features f = extract_features();
+        float sAA = 0.0f, sSHS = 0.0f;
+        diagnose_window(f, sAA, sSHS);
+
+        cumulative_AA  += sAA;
+        cumulative_SHS += sSHS;
+        window_count++;
+
+        bsad_buf_head         = 0;
+        bsad_buf_count        = 0;
+        bsad_sample_in_window = 0;
+
+        if (window_count % CONF_WINDOWS == 0) {
+            generate_bsad_report();
+            cumulative_AA  = 0.0f;
+            cumulative_SHS = 0.0f;
+        }
+    }
+}
+
+static void payload_feed(float I_pack, float v_ms, float acc, float temp_C) {
+
+    if (temp_window_start < 0.0f) temp_window_start = temp_C;
+    temp_window_end = temp_C;
+
+    
+    if (fabsf(acc) < 0.05f && v_ms > 8.0f && I_pack > 0.0f) {
+        if (ss_count < SS_BUF_MAX) {
+            ss_I_buf[ss_count] = I_pack;
+            ss_v_buf[ss_count] = v_ms;
+            ss_count++;
+        }
+    }
+
+    payload_sample_count++;
+    if (payload_sample_count >= PAYLOAD_WINDOW) {
+        evaluate_payload();
+
+        if (bsad_ready && payload_ready) {
+            float temp_rise = temp_window_end - temp_window_start;
+            print_combined_result(temp_rise);
+            bsad_ready    = false;
+            payload_ready = false;
+        }
+
+        payload_sample_count = 0;
+        ss_count             = 0;
+        temp_window_start    = -1.0f;
+    }
+}
+
+void setup() {
+    Serial.begin(115200);
+    delay(500);
+
+    analogReadResolution(12);
+    analogSetAttenuation(ADC_11db);
+
+    float T_amb_init = read_tamb();
+    sim_reset(T_amb_init);
+
+    Serial.println(F("TVS iQube 3.5 kWh — Simulator + Diagnoser v3.2 (ESP32)"));
+    Serial.println(F("Simulation started. Diagnosis report every 5 minutes."));
+}
+
+unsigned long last_tick_ms = 0;
+
+void loop() {
+    unsigned long now = millis();
+    if ((now - last_tick_ms) < (unsigned long)(TS * 1000.0f)) return;
+    last_tick_ms = now;
+
+    
+    float throttle = read_throttle();
+    float load     = read_load();
+    float T_amb    = read_tamb();
+    bool  eco_mode = false;
+
+    
+    sim_step(throttle, T_amb, load, eco_mode);
+
+    
+    Serial.println(F("-----------------------------"));
+    Serial.print(F("Throttle      : ")); Serial.print(throttle,           2); Serial.print(F("% "));
+    Serial.print(F(" Rider Load   : ")); Serial.print(load,               2); Serial.print(F("kg "));
+    Serial.print(F(" Ambient Temp : ")); Serial.print(T_amb,              2); Serial.print(F("C "));
+    Serial.print(F(" Current      : ")); Serial.print(sim.I_pack,         3); Serial.print(F("A "));
+    Serial.print(F(" Bat Temp     : ")); Serial.print(sim.T_bat,          3); Serial.print(F("C "));
+    Serial.print(F(" C-Rate       : ")); Serial.print(sim.C_rate,         4); Serial.print(F("C "));
+    Serial.print(F(" Speed        : ")); Serial.print(sim.v_ms * 3.6f,   3); Serial.print(F("km/h "));
+    Serial.print(F(" Power        : ")); Serial.print(sim.P_bat,          2); Serial.print(F("W "));
+    Serial.print(F(" SoC          : ")); Serial.print(sim.SOC * 100.0f,  3); Serial.print(F("% "));
+    Serial.print(F(" Regen Active : ")); Serial.println(sim.regen_active ? F("YES") : F("NO"));
+    Serial.println(F("-----------------------------"));
+
+    
+    diagnoser_feed(throttle,
+                   sim.v_ms * 3.6f,
+                   sim.I_pack,
+                   sim.P_bat,
+                   sim.T_bat);
+
+    payload_feed(sim.I_pack,
+                 sim.v_ms,
+                 sim.acc,
+                 sim.T_bat);
+
+    
+    if (sim.SOC <= 0.001f) {
+        Serial.println(F("# Battery depleted — simulation halted."));
+        while (true) delay(1000);
+    }
+}
