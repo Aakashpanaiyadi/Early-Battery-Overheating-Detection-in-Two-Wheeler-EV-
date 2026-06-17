@@ -1,0 +1,931 @@
+"""
+============================================================================
+ TVS iQube Electric Scooter — Real-Time EV Dashboard
+ Reads ESP32 serial telemetry and displays a visual instrument cluster.
+
+ Dependencies: tkinter (stdlib), pyserial, math, threading
+ Usage:        python ev_dashboard.py
+               Set COM_PORT below to match your ESP32 port.
+============================================================================
+"""
+
+import tkinter as tk
+from tkinter import font as tkfont
+import math
+import threading
+import time
+import re
+import queue
+
+# Try to import serial; show instructions if missing
+try:
+    import serial
+    import serial.tools.list_ports
+    SERIAL_AVAILABLE = True
+except ImportError:
+    SERIAL_AVAILABLE = False
+
+# ============================================================================
+#  CONFIGURATION
+# ============================================================================
+COM_PORT   = "COM8"      # Change to your ESP32 port (e.g. "/dev/ttyUSB0")
+BAUD_RATE  = 115200
+DEMO_MODE  = False       # Set True to run with simulated data (no ESP32 needed)
+
+# ============================================================================
+#  COLOUR PALETTE  — dark EV theme
+# ============================================================================
+BG          = "#0A0C12"
+PANEL       = "#11141C"
+PANEL2      = "#161A24"
+BORDER      = "#1E2436"
+ACCENT      = "#00C8FF"      # cyan
+ACCENT2     = "#FF6B00"      # orange
+GOOD        = "#00E676"
+WARN        = "#FFD600"
+CRIT        = "#FF3B3B"
+TEXT_PRI    = "#E8ECF8"
+TEXT_SEC    = "#5A6080"
+TEXT_DIM    = "#2E3450"
+SOC_HIGH    = "#00E676"
+SOC_MED     = "#FFD600"
+SOC_LOW     = "#FF3B3B"
+TEMP_NORM   = "#00C8FF"
+REGEN_COL   = "#00E676"
+
+
+# ============================================================================
+#  SERIAL READER THREAD
+#  Reads lines from ESP32, parses telemetry and diagnosis blocks,
+#  pushes results into a thread-safe queue for the GUI.
+# ============================================================================
+class SerialReader(threading.Thread):
+    """
+    Background thread that owns the serial port.
+    Two dict types are pushed onto data_queue:
+        {'type': 'telemetry', ...fields...}
+        {'type': 'diagnosis', ...fields...}
+    """
+
+    # Regex for the single telemetry line [FINDS THE VALUES OF EACH FROM THE SERIAL OUTPUT LINE]
+    _TELEM_RE = re.compile(
+        r"Throttle\s*:\s*([\d.]+)%.*?"
+        r"Rider Load\s*:\s*([\d.]+)kg.*?"
+        r"Ambient Temp\s*:\s*([\d.]+)C.*?"
+        r"Current\s*:\s*([-\d.]+)A.*?"
+        r"Bat Temp\s*:\s*([\d.]+)C.*?"
+        r"C-Rate\s*:\s*([-\d.]+)C.*?"
+        r"Speed\s*:\s*([\d.]+)km/h.*?"
+        r"Power\s*:\s*([-\d.]+)W.*?"
+        r"SoC\s*:\s*([\d.]+)%.*?"
+        r"Regen Active\s*:\s*(YES|NO)",
+        re.IGNORECASE#[IGNORES CASE SENSITIVITY]
+    )
+
+    def __init__(self, port, baud, data_queue):
+        super().__init__(daemon=True)#[TO STOP WHEN THE MAIN PROGRAM STOPS]
+        #[SAVES THESE BELOW VALUES AS INSTANCE FOR run()]
+        self.port       = port
+        self.baud       = baud
+        self.data_queue = data_queue
+        self.running    = True#[TO STOP OR CONTINUE THREAD]
+        self._diag_buf  = []#[TEMPORARY FOR HOLDING LINES OF DIAGNOSIS BLOCK]
+        self._in_diag   = False#[READS WHETHER THE THREAD IS INSIDE DIAGNOSIS BLOCK]
+
+    def run(self):#[WHERE BACKGROUND WORK HAPPENS]
+        ser = None
+        while self.running:#[TRIES TO CONNECT IF self.running becoms False]
+            try:
+                ser = serial.Serial(self.port, self.baud, timeout=1)#[OPENS SERIAL PORT WITH CONFIGS AND WAIT 1 SEC FOR DATA IF NOT RECIEVED RETURNS EMPTY]
+                self.data_queue.put({'type': 'status', 'msg': f'Connected on {self.port}'})#[STATUS MESSAGE OF GETTING CONNECTED TO PORT]
+                while self.running:#[KEEPS READING LINE BY LINE AS LONG AS CONNECTION HOLDS]
+                    raw = ser.readline()#[READS COMPLETE LINE FROM SERIAL PORT & WAITS UNTIL NEW CHAR ARRIVES OR AFTER 1 SEC TIMEOUT AND RETURN RAW BYTES]
+                    if not raw:
+                        continue#[IGNORES EMPTY READS AND TRY AGAIN]
+                    line = raw.decode('utf-8', errors='replace').strip()#[CONVERT TO READBLE,REPLACE PLACE HOLDER CHAR, REMOVES WHITESPACES]
+                    self._process_line(line)#[FIGURES IS IT TELEMETRY OR DIAGNOSIS LINE]
+            except serial.SerialException as e:#[SHOWS ERROR ON UNPLUGGING USB OR INVASION BY OTHER PROGRAMS]
+                self.data_queue.put({'type': 'status', 'msg': f'Serial error: {e}'})#[SENDS ERROR STATUS MSG]
+                time.sleep(2)
+            except Exception as e:#[ERRORS OTHER THAN KNOWN BY SERIAL EXCEPTION]
+                self.data_queue.put({'type': 'status', 'msg': f'Error: {e}'})#[SENDS ERROR MSG TO QUEUE]
+                time.sleep(2)
+            finally:#[GURANTEES PORT CLOSURE]
+                if ser and ser.is_open:
+                    ser.close()
+
+    def _process_line(self, line):
+        # Diagnosis block detection
+        if "5-MINUTE DIAGNOSIS REPORT" in line:#[CHECKS IF LINE HAS"5 MIN DIAG REPORT"]
+            self._in_diag  = True
+            self._diag_buf = []#CLEAR BUFFER
+            return
+        if self._in_diag:
+            if "================================================" in line:
+                self._in_diag = False
+                self._parse_diagnosis(self._diag_buf)#[PROCESS BUFF LINES AND EXTRACT VALUES]
+                self._diag_buf = []
+            else:
+                self._diag_buf.append(line)
+            return
+
+        # Telemetry line
+        m = self._TELEM_RE.search(line)#[HOLDS A M OBJ IF MATCHES REGEX OR ELSE M IS NONE]
+        if m:
+            self.data_queue.put({
+                'type'    : 'telemetry',
+                'throttle': float(m.group(1)),
+                'load'    : float(m.group(2)),
+                'amb_temp': float(m.group(3)),
+                'current' : float(m.group(4)),
+                'bat_temp': float(m.group(5)),
+                'c_rate'  : float(m.group(6)),
+                'speed'   : float(m.group(7)),
+                'power'   : float(m.group(8)),
+                'soc'     : float(m.group(9)),
+                'regen'   : m.group(10).upper() == 'YES',
+            })
+
+    def _parse_diagnosis(self, lines):
+        d = {
+            'type'       : 'diagnosis',
+            'aa_conf'    : 0.0,
+            'shs_conf'   : 0.0,
+            'dominant'   : '',
+            'dom_conf'   : 0.0,
+            'payload_kg' : 0.0,
+            'payload_pct': 0.0,
+            'overload'   : False,
+            'combined'   : '',
+            'thermal'    : '',
+        }
+        for line in lines:
+            self._try_float(line, r"AA\s+confidence\s*:\s*([\d.]+)%",  d, 'aa_conf')
+            self._try_float(line, r"SHS confidence\s*:\s*([\d.]+)%",   d, 'shs_conf')
+            self._try_float(line, r"Payload est\.\s*:\s*([\d.]+)",     d, 'payload_kg')
+            self._try_float(line, r"Payload %\s*:\s*([\d.]+)",         d, 'payload_pct')
+
+            m = re.search(r"Dominant\s*:\s*(\w+)\s*\(([\d.]+)%\)", line)
+            if m:
+                d['dominant'] = m.group(1)
+                d['dom_conf'] = float(m.group(2))
+
+            m = re.search(r"^Overload\s*:\s*(YES|NO)", line, re.IGNORECASE)
+            if m:
+                d['overload'] = m.group(1).upper() == 'YES'
+
+            m = re.search(r"Combined result\s*:\s*(.+)", line)
+            if m:
+                d['combined'] = m.group(1).strip()
+
+            m = re.search(r"Thermal\s*:\s*(.+)", line)
+            if m:
+                d['thermal'] = m.group(1).strip()
+
+        self.data_queue.put(d)
+
+    @staticmethod
+    def _try_float(line, pattern, d, key):
+        m = re.search(pattern, line)
+        if m:
+            d[key] = float(m.group(1))
+
+
+# ============================================================================
+#  DEMO DATA GENERATOR
+#  Simulates the ESP32 stream for testing without hardware.
+# ============================================================================
+class DemoReader(threading.Thread):
+    def __init__(self, data_queue):
+        super().__init__(daemon=True)
+        self.data_queue = data_queue
+        self.running    = True
+        self._t         = 0.0
+
+    def run(self):
+        self.data_queue.put({'type': 'status', 'msg': 'DEMO MODE — no serial port used'})
+        while self.running:
+            t = self._t
+            speed    = max(0.0, 35 + 30 * math.sin(t / 18) * (0.5 + 0.5 * math.sin(t / 7)))
+            throttle = max(0.0, 30 + 45 * abs(math.sin(t / 12)))
+            current  = throttle * 0.85 + 4 * math.sin(t / 3)
+            power    = 48.0 * current
+            soc      = max(10.0, 95.0 - t * 0.007)
+            bat_temp = 35.0 + current * 0.07
+            regen    = speed > 5 and throttle < 4
+
+            self.data_queue.put({
+                'type'    : 'telemetry',
+                'throttle': round(throttle, 2),
+                'load'    : 72.0,
+                'amb_temp': 34.0,
+                'current' : round(current, 3),
+                'bat_temp': round(bat_temp, 3),
+                'c_rate'  : round(current / 67.3, 4),
+                'speed'   : round(speed, 3),
+                'power'   : round(power, 2),
+                'soc'     : round(soc, 3),
+                'regen'   : regen,
+            })
+            self._t += 0.1
+            time.sleep(0.1)
+
+
+# ============================================================================
+#  METRIC TILE — a tk.Frame based label box, no canvas coords needed
+# ============================================================================
+class MetricTile(tk.Frame):
+    def __init__(self, parent, label, unit="", accent=ACCENT):
+        super().__init__(parent, bg=PANEL2, highlightbackground=accent,
+                         highlightthickness=2)
+        tk.Label(self, text=label, bg=PANEL2, fg=TEXT_SEC,
+                 font=("Helvetica", 9)).pack(pady=(6, 0))
+        self._val_lbl = tk.Label(self, text="---", bg=PANEL2, fg=TEXT_PRI,
+                                 font=("Helvetica", 22, "bold"))
+        self._val_lbl.pack()
+        tk.Label(self, text=unit, bg=PANEL2, fg=TEXT_SEC,
+                 font=("Helvetica", 8)).pack(pady=(0, 6))
+
+    def update(self, value_str, colour=None):
+        self._val_lbl.config(text=value_str, fg=colour or TEXT_PRI)
+
+
+# ============================================================================
+#  SPEEDOMETER — canvas arc gauge, but sized/placed by grid not by coords
+# ============================================================================
+class Speedometer(tk.Canvas):
+    START_DEG = 210
+    SWEEP_DEG = 240
+    R = 110   # arc radius
+
+    def __init__(self, parent):
+        size = (self.R + 40) * 2
+        super().__init__(parent, width=size, height=size,
+                         bg=BG, highlightthickness=0)
+        self._cx          = size // 2
+        self._cy          = size // 2
+        self._items       = {}
+        self._prev_regen  = False
+        self._flash_ticks = 0
+        self._build()
+
+    def _build(self):
+        cx, cy, ro = self._cx, self._cy, self.R
+
+        # dim background track
+        self.create_arc(cx - ro, cy - ro, cx + ro, cy + ro,
+                        start=-(self.START_DEG - 180),
+                        extent=-self.SWEEP_DEG,
+                        outline=TEXT_DIM, width=12, style=tk.ARC)
+
+        # active arc
+        self._items['arc'] = self.create_arc(
+            cx - ro, cy - ro, cx + ro, cy + ro,
+            start=-(self.START_DEG - 180),
+            extent=-0.5, outline=ACCENT, width=12, style=tk.ARC)
+
+        # regen ring
+        rr = ro - 18
+        self._items['regen'] = self.create_arc(
+            cx - rr, cy - rr, cx + rr, cy + rr,
+            start=-(self.START_DEG - 180),
+            extent=0, outline=REGEN_COL, width=4, style=tk.ARC)
+
+        # speed value
+        self._items['val'] = self.create_text(
+            cx, cy - 8, text="0",
+            fill=TEXT_PRI, font=("Helvetica", 44, "bold"))
+        self.create_text(cx, cy + 30, text="km/h",
+                         fill=TEXT_SEC, font=("Helvetica", 11))
+
+        # tick marks
+        for spd in range(0, 90, 10):
+            frac  = spd / 80.0
+            angle = math.radians(self.START_DEG - frac * self.SWEEP_DEG)
+            ca, sa = math.cos(angle), -math.sin(angle)
+            major = (spd % 20 == 0)
+            r1 = ro + 14
+            r2 = ro + (24 if major else 18)
+            self.create_line(cx + ca * r1, cy + sa * r1,
+                             cx + ca * r2, cy + sa * r2,
+                             fill=TEXT_SEC if major else TEXT_DIM,
+                             width=2 if major else 1)
+
+    def update(self, speed_kmh, regen=False):
+        speed_kmh = max(0.0, min(80.0, speed_kmh))
+        frac      = speed_kmh / 80.0
+        extent    = -(max(frac, 0.003) * self.SWEEP_DEG)
+        speed_col = ACCENT if frac < 0.6 else (WARN if frac < 0.85 else CRIT)
+
+        # regen flash: when regen just turned on, start a 1.5 s flash counter
+        if regen and not self._prev_regen:
+            self._flash_ticks = 15          # 15 x 100 ms = 1.5 s
+        self._prev_regen = regen
+
+        if self._flash_ticks > 0:
+            self._flash_ticks -= 1
+            # pulse between green and white every 3 ticks
+            ring_col = REGEN_COL if (self._flash_ticks % 6) >= 3 else "#AAFFCC"
+        else:
+            ring_col = speed_col            # ring matches speed arc colour normally
+
+        self.itemconfig(self._items['arc'], extent=extent, outline=ring_col)
+        regen_ext = -(frac * self.SWEEP_DEG) if (regen and speed_kmh > 2) else 0
+        self.itemconfig(self._items['regen'], extent=regen_ext)
+        self.itemconfig(self._items['val'], text=f"{int(speed_kmh)}", fill=speed_col)
+
+
+# ============================================================================
+#  CONF BAR — a simple horizontal progress bar using a tk.Frame
+# ============================================================================
+class ConfBar(tk.Frame):
+    def __init__(self, parent, label, colour):
+        super().__init__(parent, bg=PANEL)
+        self._colour = colour
+        tk.Label(self, text=label, bg=PANEL, fg=TEXT_SEC,
+                 font=("Helvetica", 8)).pack(anchor="w")
+        track = tk.Frame(self, bg=TEXT_DIM, height=12)
+        track.pack(fill="x")
+        track.pack_propagate(False)
+        self._bar = tk.Frame(track, bg=colour, height=12, width=0)
+        self._bar.place(x=0, y=0, relheight=1.0, relwidth=0.0)
+        self._pct_lbl = tk.Label(self, text="0.0%", bg=PANEL,
+                                 fg=colour, font=("Helvetica", 9, "bold"))
+        self._pct_lbl.pack(anchor="w")
+        self._track = track
+
+    def update(self, pct):
+        pct = max(0.0, min(100.0, pct))
+        self._bar.place(relwidth=pct / 100.0)
+        self._pct_lbl.config(text=f"{pct:.1f}%")
+
+
+# ============================================================================
+#  MAIN DASHBOARD WINDOW  — pure grid/pack layout, zero manual coordinates
+# ============================================================================
+class Dashboard(tk.Tk):
+    def __init__(self, data_queue):
+        super().__init__()
+        self.data_queue   = data_queue
+        self._telem       = {
+            'throttle': 0, 'load': 0, 'amb_temp': 0,
+            'current': 0, 'bat_temp': 35, 'c_rate': 0,
+            'speed': 0, 'power': 0, 'soc': 100, 'regen': False,
+        }
+        self._status_text = "Connecting…"
+        self._last_diag   = None
+        self._elapsed_s   = 0
+        self._alert_timeout_id  = None   # Track alert timeout
+        self._alert_countdown   = 0      # Seconds remaining on overlay
+        self._alert_blink_state = False  # For blinking title bar
+        self._alert_blink_id    = None   # Blink after-id
+        self._alert_countdown_id= None   # Countdown after-id
+
+        self.title("TVS iQube — Live EV Dashboard")
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        self._build_ui()
+        self._poll()
+        self._tick_timer()
+
+    # ─────────────────────────────────────────────────────────────────────
+    def _lbl(self, parent, text, fg=TEXT_SEC, font=("Helvetica", 9),
+             **kw):
+        """Convenience: create a Label with dark background."""
+        return tk.Label(parent, text=text, bg=parent["bg"],
+                        fg=fg, font=font, **kw)
+
+    def _frame(self, parent, bg=PANEL, **kw):
+        return tk.Frame(parent, bg=bg, **kw)
+
+    # ─────────────────────────────────────────────────────────────────────
+    def _build_ui(self):
+        # ── header ───────────────────────────────────────────────────────
+        hdr = self._frame(self, bg=PANEL)
+        hdr.pack(fill="x")
+        self._lbl(hdr, "TVS iQUBE  ·  LIVE INSTRUMENT CLUSTER",
+                  fg=ACCENT, font=("Helvetica", 12, "bold")).pack(side="left", padx=14, pady=8)
+        self._status_lbl = self._lbl(hdr, "Connecting…", fg=TEXT_SEC,
+                                     font=("Helvetica", 9))
+        self._status_lbl.pack(side="right", padx=14)
+
+        # ── modal alert overlay (hidden until triggered) ──────────────────
+        self._build_alert_overlay()
+
+        # ── main body: left tiles | speedo | right tiles ─────────────────
+        body = self._frame(self, bg=BG)
+        body.pack(fill="both", expand=True, padx=8, pady=4)
+
+        left  = self._build_tile_col(body, "DRIVE",
+                                     [("THROTTLE", "%",  ACCENT2),
+                                      ("CURRENT",  "A",  ACCENT2),
+                                      ("RIDER LOAD","kg", TEXT_SEC)])
+        left.pack(side="left", fill="y", padx=(0, 8))
+
+        centre = self._build_centre(body)
+        centre.pack(side="left", fill="both", expand=True)
+
+        right = self._build_tile_col(body, "BATTERY",
+                                     [("BAT TEMP", "°C", CRIT),
+                                      ("AMB TEMP", "°C", TEXT_SEC),
+                                      ("C-RATE",   "C",  WARN),
+                                      ("SOC",      "%",  GOOD)])
+        right.pack(side="left", fill="y", padx=(8, 0))
+
+        # ── diagnosis panel ───────────────────────────────────────────────
+        self._build_diagnosis_panel()
+
+        # ── footer ────────────────────────────────────────────────────────
+        ftr = self._frame(self, bg=PANEL)
+        ftr.pack(fill="x")
+        self._footer_lbl = self._lbl(ftr, "", fg=TEXT_SEC,
+                                     font=("Helvetica", 8))
+        self._footer_lbl.pack(pady=4)
+
+    # ── left / right tile columns ─────────────────────────────────────────
+    def _build_tile_col(self, parent, heading, specs):
+        col = self._frame(parent, bg=BG)
+        self._lbl(col, heading, fg=TEXT_SEC,
+                  font=("Helvetica", 8, "bold")).pack(pady=(4, 2))
+        tiles = []
+        for label, unit, accent in specs:
+            t = MetricTile(col, label, unit, accent)
+            t.pack(fill="x", pady=3, ipadx=18)
+            tiles.append(t)
+
+        # store by label for easy lookup
+        key_map = {
+            "THROTTLE":   "_tile_throttle",
+            "CURRENT":    "_tile_current",
+            "POWER":      "_tile_power",
+            "RIDER LOAD": "_tile_load",
+            "BAT TEMP":   "_tile_bat_temp",
+            "AMB TEMP":   "_tile_amb_temp",
+            "C-RATE":     "_tile_crate",
+            "SOC":        "_tile_soc_num",
+        }
+        for tile, (label, _, __) in zip(tiles, specs):
+            attr = key_map.get(label)
+            if attr:
+                setattr(self, attr, tile)
+        return col
+
+    # ── centre column: regen label + speedometer + SOC bar ───────────────
+    def _build_centre(self, parent):
+        col = self._frame(parent, bg=BG)
+
+        top_row = self._frame(col, bg=BG)
+        top_row.pack(fill="x", pady=(4, 0))
+
+        self._regen_lbl = tk.Label(top_row, text="", bg=BG, fg=REGEN_COL,
+                                   font=("Helvetica", 10, "bold"))
+        self._regen_lbl.pack(side="left", expand=True)
+
+        self._timer_lbl = tk.Label(top_row, text="00:00", bg=BG, fg=TEXT_SEC,
+                                   font=("Helvetica", 10, "bold"))
+        self._timer_lbl.pack(side="right", padx=8)
+
+        self._speedo = Speedometer(col)
+        self._speedo.pack()
+
+        self._lbl(col, "STATE OF CHARGE", fg=TEXT_SEC,
+                  font=("Helvetica", 8)).pack(pady=(6, 1))
+
+        soc_track = self._frame(col, bg=TEXT_DIM)
+        soc_track.pack(fill="x", padx=30)
+        soc_track.pack_propagate(False)
+        soc_track.configure(height=18)
+        self._soc_bar_inner = tk.Frame(soc_track, bg=SOC_HIGH, height=18)
+        self._soc_bar_inner.place(x=0, y=0, relheight=1.0, relwidth=1.0)
+        self._soc_lbl = tk.Label(soc_track, text="100%", bg=SOC_HIGH,
+                                 fg=BG, font=("Helvetica", 9, "bold"))
+        self._soc_lbl.place(relx=0.5, rely=0.5, anchor="center")
+
+        return col
+
+    def _tick_timer(self):
+        self._elapsed_s += 1
+        mins = self._elapsed_s // 60
+        secs = self._elapsed_s % 60
+        self._timer_lbl.config(text=f"{mins:02d}:{secs:02d}")
+        self.after(1000, self._tick_timer)
+
+    def _update_soc_bar(self, soc_pct):
+        soc_pct = max(0.0, min(100.0, soc_pct))
+        col = SOC_HIGH if soc_pct > 50 else (SOC_MED if soc_pct > 20 else SOC_LOW)
+        self._soc_bar_inner.place(relwidth=soc_pct / 100.0)
+        self._soc_bar_inner.config(bg=col)
+        self._soc_lbl.config(text=f"{soc_pct:.1f}%", bg=col,
+                             fg=BG if soc_pct > 15 else TEXT_PRI)
+
+    # ── modal alert overlay ───────────────────────────────────────────────
+    def _build_alert_overlay(self):
+        """
+        Alert card floats directly over the dashboard via place().
+        Hidden by default (place_forget). Shown on WARNING / ADVISORY.
+        Dashboard remains fully visible behind it.
+        """
+        # Card placed directly on the Dashboard window — no scrim
+        card = tk.Frame(self, bg="#1A1A1A",
+                        highlightthickness=4, highlightbackground=CRIT,
+                        padx=0, pady=0)
+        self._alert_card = card
+
+        # ── title bar (⚠ ALERT: …) ──
+        self._alert_title_bar = tk.Frame(card, bg=CRIT, padx=12, pady=8)
+        self._alert_title_bar.pack(fill="x")
+
+        self._alert_icon_lbl = tk.Label(self._alert_title_bar,
+                                        text="⚠", bg=CRIT, fg="white",
+                                        font=("Helvetica", 18, "bold"))
+        self._alert_icon_lbl.pack(side="left")
+
+        self._alert_title_lbl = tk.Label(self._alert_title_bar,
+                                         text="ALERT: THERMAL WARNING",
+                                         bg=CRIT, fg="white",
+                                         font=("Helvetica", 16, "bold"))
+        self._alert_title_lbl.pack(side="left", padx=(8, 20))
+
+        tk.Label(self._alert_title_bar, text="⚠", bg=CRIT, fg="white",
+                 font=("Helvetica", 18, "bold")).pack(side="right")
+
+        # ── body message ──
+        self._alert_body_frm = tk.Frame(card, bg="#1A1A1A", padx=28, pady=16)
+        self._alert_body_frm.pack(fill="x")
+
+        self._alert_msg_lbl = tk.Label(self._alert_body_frm,
+                                       text="",
+                                       bg="#1A1A1A", fg=TEXT_PRI,
+                                       font=("Helvetica", 13),
+                                       wraplength=420, justify="center")
+        self._alert_msg_lbl.pack()
+
+        # ── dismiss / countdown bar ──
+        dismiss_frm = tk.Frame(card, bg=ACCENT2, padx=0, pady=0)
+        dismiss_frm.pack(fill="x")
+
+        self._dismiss_lbl = tk.Label(dismiss_frm,
+                                     text="DISMISS  [X]   (closing in 5s)",
+                                     bg=ACCENT2, fg="white",
+                                     font=("Helvetica", 12, "bold"),
+                                     pady=10, cursor="hand2")
+        self._dismiss_lbl.pack(fill="x")
+        self._dismiss_lbl.bind("<Button-1>", lambda e: self._dismiss_alert())
+        dismiss_frm.bind("<Button-1>",       lambda e: self._dismiss_alert())
+
+        # Start hidden
+        self._overlay_visible = False
+
+    def _show_alert(self, thermal_text, is_warning):
+        """Show the modal overlay with appropriate colours and start countdown."""
+        colour     = CRIT if is_warning else WARN
+        title_text = "ALERT: THERMAL WARNING" if is_warning else "ADVISORY: THERMAL NOTICE"
+        icon       = "⚠" if is_warning else "⚑"
+
+        # Update card colours
+        self._alert_card.config(highlightbackground=colour)
+        self._alert_title_bar.config(bg=colour)
+        self._alert_icon_lbl.config(bg=colour, text=icon)
+        self._alert_title_lbl.config(bg=colour, text=title_text)
+        # update right icon widget
+        for w in self._alert_title_bar.winfo_children():
+            if isinstance(w, tk.Label) and w != self._alert_icon_lbl \
+                    and w != self._alert_title_lbl:
+                w.config(bg=colour, text=icon)
+
+        self._alert_msg_lbl.config(text=thermal_text)
+
+        # Cancel any pending timers
+        for attr in ('_alert_blink_id', '_alert_countdown_id', '_alert_timeout_id'):
+            tid = getattr(self, attr, None)
+            if tid:
+                self.after_cancel(tid)
+                setattr(self, attr, None)
+
+        # Float card over dashboard (centre of window)
+        self._alert_card.place(relx=0.5, rely=0.5, anchor="center")
+        self._alert_card.lift()
+        self._overlay_visible = True
+
+        # Countdown
+        self._alert_countdown = 5
+        self._alert_blink_state = False
+        self._tick_alert_countdown(colour)
+
+    def _tick_alert_countdown(self, colour):
+        """Update countdown label + blink title bar each second."""
+        if not self._overlay_visible:
+            return
+
+        # Blink: toggle title bar colour
+        self._alert_blink_state = not self._alert_blink_state
+        blink_col = colour if self._alert_blink_state else "#5A0000" \
+            if colour == CRIT else "#6B5500"
+        self._alert_title_bar.config(bg=blink_col)
+        self._alert_icon_lbl.config(bg=blink_col)
+        self._alert_title_lbl.config(bg=blink_col)
+        for w in self._alert_title_bar.winfo_children():
+            if isinstance(w, tk.Label) and w != self._alert_icon_lbl \
+                    and w != self._alert_title_lbl:
+                w.config(bg=blink_col)
+
+        # Update dismiss label countdown
+        s = self._alert_countdown
+        self._dismiss_lbl.config(
+            text=f"DISMISS  [X]   (closing in {s}s)")
+
+        if self._alert_countdown <= 0:
+            self._dismiss_alert()
+            return
+
+        self._alert_countdown -= 1
+        self._alert_countdown_id = self.after(
+            1000, lambda: self._tick_alert_countdown(colour))
+
+    def _dismiss_alert(self):
+        """Hide the overlay and reset diagnosis."""
+        # Cancel pending timers
+        for attr in ('_alert_blink_id', '_alert_countdown_id', '_alert_timeout_id'):
+            tid = getattr(self, attr, None)
+            if tid:
+                self.after_cancel(tid)
+                setattr(self, attr, None)
+
+        self._alert_card.place_forget()
+        self._overlay_visible = False
+        self._reset_diagnosis()
+
+    # ── diagnosis panel ───────────────────────────────────────────────────
+    def _build_diagnosis_panel(self):
+        outer = self._frame(self, bg=PANEL,
+                            highlightbackground=BORDER, highlightthickness=1)
+        outer.pack(fill="x", padx=8, pady=4)
+
+        top = self._frame(outer, bg=PANEL)
+        top.pack(fill="x", padx=8, pady=(6, 2))
+        self._lbl(top, "5-MIN DIAGNOSIS", fg=ACCENT,
+                  font=("Helvetica", 9, "bold")).pack(side="left")
+
+        row = self._frame(outer, bg=PANEL)
+        row.pack(fill="x", padx=8, pady=(0, 8))
+
+        # AA conf bar
+        aa_col = self._frame(row, bg=PANEL)
+        aa_col.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self._aa_bar = ConfBar(aa_col, "AA CONF", ACCENT2)
+        self._aa_bar.pack(fill="x")
+
+        # SHS conf bar
+        shs_col = self._frame(row, bg=PANEL)
+        shs_col.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self._shs_bar = ConfBar(shs_col, "SHS CONF", ACCENT)
+        self._shs_bar.pack(fill="x")
+
+        # Dominant
+        dom_col = self._frame(row, bg=PANEL)
+        dom_col.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self._lbl(dom_col, "DOMINANT", fg=TEXT_SEC,
+                  font=("Helvetica", 8)).pack(anchor="w")
+        self._dom_lbl = tk.Label(dom_col, text="---", bg=PANEL,
+                                 fg=TEXT_SEC, font=("Helvetica", 14, "bold"),
+                                 anchor="w")
+        self._dom_lbl.pack(anchor="w")
+
+        # Payload
+        pay_col = self._frame(row, bg=PANEL)
+        pay_col.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self._lbl(pay_col, "PAYLOAD", fg=TEXT_SEC,
+                  font=("Helvetica", 8)).pack(anchor="w")
+        self._payload_lbl  = tk.Label(pay_col, text="--- kg", bg=PANEL,
+                                      fg=TEXT_PRI, font=("Helvetica", 13, "bold"),
+                                      anchor="w")
+        self._payload_lbl.pack(anchor="w")
+        self._overload_lbl = tk.Label(pay_col, text="", bg=PANEL,
+                                      fg=CRIT, font=("Helvetica", 9, "bold"),
+                                      anchor="w")
+        self._overload_lbl.pack(anchor="w")
+
+        # Result
+        res_col = self._frame(row, bg=PANEL)
+        res_col.pack(side="left", fill="x", expand=True)
+        self._lbl(res_col, "RESULT", fg=TEXT_SEC,
+                  font=("Helvetica", 8)).pack(anchor="w")
+        self._combined_lbl = tk.Label(res_col, text="Awaiting\n5-min window",
+                                      bg=PANEL, fg=TEXT_SEC,
+                                      font=("Helvetica", 9),
+                                      justify="left", anchor="w")
+        self._combined_lbl.pack(anchor="w")
+
+    # ── Queue polling ─────────────────────────────────────────────────────
+    def _poll(self):
+        while True:
+            try:
+                msg = self.data_queue.get_nowait()
+                self._handle_message(msg)
+            except queue.Empty:
+                break
+        self._refresh()
+        self.after(100, self._poll)
+
+    def _handle_message(self, msg):
+        if msg['type'] == 'telemetry':
+            self._telem = msg
+        elif msg['type'] == 'diagnosis':
+            self._last_diag = msg
+            self._update_diagnosis(msg)
+        elif msg['type'] == 'status':
+            self._status_text = msg['msg']
+
+    # ── Refresh live values ───────────────────────────────────────────────
+    def _refresh(self):
+        t = self._telem
+
+        self._speedo.update(t['speed'], t['regen'])
+        self._update_soc_bar(t['soc'])
+        self._regen_lbl.config(text="⟳  REGEN ACTIVE" if t['regen'] else "")
+
+        self._tile_throttle.update(f"{int(t['throttle'])}")
+        self._tile_current.update(
+            f"{int(t['current'])}",
+            colour=(CRIT if t['current'] > 100 else
+                    WARN if t['current'] > 70 else TEXT_PRI))
+        self._tile_load.update(f"{int(t['load'])}")
+
+        bat_col = (CRIT if t['bat_temp'] >= 55 else
+                   WARN if t['bat_temp'] >= 45 else TEMP_NORM)
+        self._tile_bat_temp.update(f"{t['bat_temp']:.1f}", colour=bat_col)
+        self._tile_amb_temp.update(f"{t['amb_temp']:.1f}")
+        self._tile_crate.update(f"{t['c_rate']:.3f}")
+        soc_col = (SOC_LOW if t['soc'] < 20 else
+                   SOC_MED if t['soc'] < 50 else SOC_HIGH)
+        self._tile_soc_num.update(f"{t['soc']:.1f}", colour=soc_col)
+
+        # re-apply last diagnosis bars so they stay visible between reports
+        if self._last_diag:
+            self._aa_bar.update(self._last_diag['aa_conf'])
+            self._shs_bar.update(self._last_diag['shs_conf'])
+
+        self._status_lbl.config(text=self._status_text)
+        self._footer_lbl.config(
+            text=(f"Throttle {int(t['throttle'])}%  |  "
+                  f"Speed {int(t['speed'])} km/h  |  "
+                  f"SOC {t['soc']:.1f}%  |  "
+                  f"Bat {t['bat_temp']:.1f}°C  |  "
+                  f"Current {int(t['current'])}A  |  "
+                  f"{'REGEN' if t['regen'] else 'DRIVE'}"))
+
+    # ── Apply diagnosis report ────────────────────────────────────────────
+    def _update_diagnosis(self, d):
+        # Cancel any existing alert timeout
+        if self._alert_timeout_id is not None:
+            self.after_cancel(self._alert_timeout_id)
+            self._alert_timeout_id = None
+
+        self._aa_bar.update(d['aa_conf'])
+        self._shs_bar.update(d['shs_conf'])
+
+        dom     = d['dominant']
+        dom_col = ACCENT2 if dom == 'AA' else ACCENT
+        self._dom_lbl.config(
+            text=f"{dom}  {d['dom_conf']:.1f}%" if dom else "---",
+            fg=dom_col if dom else TEXT_SEC)
+
+        ol_col = CRIT if d['overload'] else GOOD
+        self._payload_lbl.config(
+            text=f"{d['payload_kg']:.1f} kg  ({d['payload_pct']:.0f}%)",
+            fg=ol_col)
+        self._overload_lbl.config(
+            text="⚠ OVERLOAD" if d['overload'] else "")
+        self._combined_lbl.config(
+            text=d['combined'] if d['combined'] else "No pattern")
+
+        thermal = d.get('thermal', '')
+        if 'WARNING' in thermal.upper():
+            self._show_alert(thermal, is_warning=True)
+        elif 'ADVISORY' in thermal.upper():
+            self._show_alert(thermal, is_warning=False)
+        else:
+            # No alert — schedule regular diagnosis reset
+            self._alert_timeout_id = self.after(5000, self._reset_diagnosis)
+
+    def _reset_diagnosis(self):
+        """Reset the diagnosis display after the alert timeout"""
+        # Reset diagnosis bars to 0
+        self._aa_bar.update(0)
+        self._shs_bar.update(0)
+
+        # Reset dominant label
+        self._dom_lbl.config(text="---", fg=TEXT_SEC)
+
+        # Reset payload labels
+        self._payload_lbl.config(text="--- kg", fg=TEXT_PRI)
+        self._overload_lbl.config(text="")
+
+        # Reset combined result label
+        self._combined_lbl.config(text="Awaiting\n5-min window", fg=TEXT_SEC)
+
+        # Clear the timeout ID
+        self._alert_timeout_id = None
+
+        # Clear the stored last diagnosis
+        self._last_diag = None
+
+
+# ============================================================================
+#  PORT SELECTOR DIALOG
+# ============================================================================
+class PortSelector(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("EV Dashboard — Connect")
+        self.configure(bg=BG)
+        self.resizable(False, False)
+        self.selected_port = None
+        self._build()
+        self.geometry("400x270")
+
+    def _build(self):
+        tk.Label(self, text="TVS iQube EV Dashboard",
+                 bg=BG, fg=ACCENT,
+                 font=("Helvetica", 15, "bold")).pack(pady=(22, 4))
+        tk.Label(self, text="Select ESP32 Serial Port",
+                 bg=BG, fg=TEXT_SEC,
+                 font=("Helvetica", 10)).pack(pady=(0, 10))
+
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+        if not ports:
+            ports = ["No ports found"]
+
+        self._var = tk.StringVar(value=ports[0])
+        om = tk.OptionMenu(self, self._var, *ports)
+        om.config(bg=PANEL2, fg=TEXT_PRI, activebackground=PANEL,
+                  activeforeground=ACCENT, highlightthickness=0,
+                  font=("Helvetica", 11), relief="flat", bd=0)
+        om.pack()
+
+        tk.Label(self, text="or type port manually:",
+                 bg=BG, fg=TEXT_SEC,
+                 font=("Helvetica", 9)).pack(pady=(12, 2))
+        self._manual = tk.StringVar(value=COM_PORT)
+        tk.Entry(self, textvariable=self._manual,
+                 bg=PANEL2, fg=TEXT_PRI,
+                 insertbackground=ACCENT,
+                 font=("Helvetica", 11),
+                 relief="flat", bd=6).pack(pady=2)
+
+        frm = tk.Frame(self, bg=BG)
+        frm.pack(pady=16)
+        tk.Button(frm, text="Connect",
+                  bg=ACCENT, fg=BG,
+                  font=("Helvetica", 11, "bold"),
+                  relief="flat", bd=0, padx=18, pady=7,
+                  command=self._connect).pack(side="left", padx=6)
+        tk.Button(frm, text="Demo Mode",
+                  bg=PANEL2, fg=TEXT_SEC,
+                  font=("Helvetica", 10),
+                  relief="flat", bd=0, padx=14, pady=7,
+                  command=self._demo).pack(side="left", padx=6)
+
+    def _connect(self):
+        self.selected_port = self._manual.get().strip() or self._var.get()
+        self.destroy()
+
+    def _demo(self):
+        self.selected_port = "DEMO"
+        self.destroy()
+
+
+# ============================================================================
+#  ENTRY POINT
+# ============================================================================
+def main():
+    global DEMO_MODE, COM_PORT
+
+    if not SERIAL_AVAILABLE:
+        print("pyserial not installed. Running in demo mode.")
+        print("Install with:  pip install pyserial")
+        DEMO_MODE = True
+
+    data_queue = queue.Queue()
+
+    if not DEMO_MODE:
+        selector = PortSelector()
+        selector.mainloop()
+        if selector.selected_port is None:
+            return
+        if selector.selected_port == "DEMO":
+            DEMO_MODE = True
+        else:
+            COM_PORT = selector.selected_port
+
+    # Start background data reader
+    reader = DemoReader(data_queue) if DEMO_MODE else \
+             SerialReader(COM_PORT, BAUD_RATE, data_queue)
+    reader.start()
+
+    # Launch dashboard (blocks until window closed)
+    Dashboard(data_queue).mainloop()
+
+
+if __name__ == "__main__":
+    main()
