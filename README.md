@@ -61,3 +61,10 @@ The project operates through a structured pipeline that repeats continuously dur
 * **Weight Analysis**: Over 5-minute intervals, the system looks for stable, steady cruising periods to isolate and calculate the actual weight of the rider.
 
 4. **Combined Reporting & Alerting**: Every 5 minutes, a master diagnosis report is generated. If the combined behavior shows aggressive tendencies paired with an elevated temperature rise rate, the software triggers immediate visual alerts (Advisories or Warnings) on the instrument cluster dashboard before battery cells degrade.
+
+
+# OUTPUT
+
+
+<img width="1150" height="532" alt="image" src="https://github.com/user-attachments/assets/d29067c8-a40f-4e4e-80cc-6934f062e9f6" />
+
