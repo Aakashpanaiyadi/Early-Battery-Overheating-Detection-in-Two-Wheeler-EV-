@@ -1,10 +1,39 @@
+/*
+============================================================================
+ TVS iQube Electric Scooter — Simulation + Feature Extraction + Diagnosis
+ ESP32 Combined  |  v3.2
+
+ Hardware:
+   GPIO 34 — Potentiometer 1 → Throttle   (0–100 %)
+   GPIO 35 — Potentiometer 2 → Rider Load (40–150 kg)
+   GPIO 32 — Potentiometer 3 → Ambient Temp (30–50 °C)
+
+ All simulation physics, LUT values, and ECM logic preserved exactly
+ from Python v2.0.
+
+ All feature extraction, BSAD diagnosis, and payload estimation logic
+ preserved exactly from Python v3.2.
+
+ Output:
+   Serial (115200 baud) — live telemetry every 100 ms,
+                          diagnosis report every 5 minutes.
+============================================================================
+*/
+
 #include <Arduino.h>
 #include <string.h>
 #include <math.h>
+
+// ============================================================================
+//  ADC PIN ASSIGNMENTS
+// ============================================================================
 #define PIN_THROTTLE   34
 #define PIN_LOAD       35
 #define PIN_TAMB       32
 
+// ============================================================================
+//  VEHICLE PARAMETERS  (unchanged from Python v2.0)
+// ============================================================================
 const float PACK_V_NOM        = 52.0f;
 const float PACK_V_FULL       = 58.8f;
 const float PACK_V_CUTOFF     = 42.0f;
@@ -66,12 +95,18 @@ const float BOOST_THROTTLE_RATE = 250.0f;
 
 const float TS = 0.1f;
 
+// ============================================================================
+//  DIAGNOSIS CONSTANTS  (unchanged from Python v3.2)
+// ============================================================================
 const int   BSAD_WINDOW    = 600;
 const int   CONF_WINDOWS   = 5;
 const int   PAYLOAD_WINDOW = 3000;
 const float MAX_PAYLOAD    = 120.0f;
 #define     SS_BUF_MAX     3000
 
+// ============================================================================
+//  2RC-ECM LUT  (unchanged from Python v2.0)
+// ============================================================================
 const int LUT_N = 11;
 const float SOC_PTS[LUT_N] = {0.0f,0.1f,0.2f,0.3f,0.4f,0.5f,
                                0.6f,0.7f,0.8f,0.9f,1.0f};
@@ -87,6 +122,12 @@ const float C1_PTS[LUT_N]  = {3200.f,5200.f,7200.f,8800.f,10400.f,11600.f,
                                12400.f,12800.f,12000.f,10800.f,9600.f};
 const float C2_PTS[LUT_N]  = {14000.f,28000.f,42000.f,54000.f,62000.f,68000.f,
                                72000.f,70000.f,66000.f,60000.f,52000.f};
+
+// ============================================================================
+//  STRUCT DECLARATIONS  — all structs declared here before any function
+//  that references them, avoiding Arduino IDE forward-declaration bugs.
+// ============================================================================
+
 struct SimState {
     float SOC;
     float V1, V2;
@@ -139,13 +180,19 @@ struct Features {
     float temp_rise_per_min;
 };
 
+// ============================================================================
+//  GLOBAL INSTANCES
+// ============================================================================
+
 SimState sim;
 
+// BSAD buffer
 static BsadSample bsad_buf[BSAD_WINDOW];
 static int  bsad_buf_head         = 0;
 static int  bsad_buf_count        = 0;
 static int  bsad_sample_in_window = 0;
 
+// BSAD diagnoser state
 static float cumulative_AA  = 0.0f;
 static float cumulative_SHS = 0.0f;
 static int   window_count   = 0;
@@ -155,6 +202,7 @@ static char  last_dominant[4] = "";
 static float last_dom_conf  = 0.0f;
 static bool  bsad_ready     = false;
 
+// Payload estimator state
 static float ss_I_buf[SS_BUF_MAX];
 static float ss_v_buf[SS_BUF_MAX];
 static int   ss_count         = 0;
@@ -163,18 +211,23 @@ static float payload_pct      = 0.0f;
 static bool  overload_flag    = false;
 static bool  payload_ready    = false;
 
+// 5-minute window counters
 static int   payload_sample_count = 0;
 static float temp_window_start    = -1.0f;
 static float temp_window_end      = 0.0f;
 
+// Working arrays for extract_features() — static to avoid stack overflow
 static float _t[BSAD_WINDOW];
 static float _s[BSAD_WINDOW];
 static float _c[BSAD_WINDOW];
 static float _p[BSAD_WINDOW];
 static float _tmp[BSAD_WINDOW];
-static float _accel[BSAD_WINDOW];       
+static float _accel[BSAD_WINDOW];       // length used: BSAD_WINDOW-1
 static float _accel_pos[BSAD_WINDOW];
 
+// ============================================================================
+//  LUT INTERPOLATION  (unchanged from original ESP32)
+// ============================================================================
 float lut(float soc, const float* table) {
     if (soc <= 0.0f) return table[0];
     if (soc >= 1.0f) return table[LUT_N - 1];
@@ -187,6 +240,9 @@ float lut(float soc, const float* table) {
     return table[LUT_N - 1];
 }
 
+// ============================================================================
+//  VARIABLE C-RATE TARGET  (unchanged from original ESP32)
+// ============================================================================
 float target_c_rate(float speed_kmh, float throttle_pct, bool eco_mode) {
     float thr = throttle_pct / 100.0f;
     if (eco_mode) return 0.67f * thr;
@@ -203,6 +259,9 @@ float target_c_rate(float speed_kmh, float throttle_pct, bool eco_mode) {
     return c_peak * thr;
 }
 
+// ============================================================================
+//  SIM RESET  (unchanged from original ESP32)
+// ============================================================================
 void sim_reset(float T_amb) {
     sim.SOC               = 1.0f;
     sim.V1                = 0.0f;
@@ -235,6 +294,9 @@ void sim_reset(float T_amb) {
     sim.regen_torque      = 0.0f;
 }
 
+// ============================================================================
+//  SIMULATION STEP  (unchanged from original ESP32)
+// ============================================================================
 void sim_step(float throttle_pct, float T_amb, float rider_kg, bool eco_mode) {
     sim.t += TS;
 
@@ -385,6 +447,9 @@ void sim_step(float throttle_pct, float T_amb, float rider_kg, bool eco_mode) {
     sim.T_bat  = fminf(90.0f, sim.T_bat + dT);
 }
 
+// ============================================================================
+//  ADC HELPERS  (unchanged from original ESP32)
+// ============================================================================
 float read_throttle() {
     int raw = analogRead(PIN_THROTTLE);
     return (raw / 4095.0f) * 100.0f;
@@ -398,6 +463,9 @@ float read_tamb() {
     return 30.0f + (raw / 4095.0f) * 20.0f;
 }
 
+// ============================================================================
+//  MATH HELPERS  (direct translation from Python / numpy)
+// ============================================================================
 static float std_dev(const float* arr, int n) {
     if (n <= 0) return 0.0f;
     float sum = 0.0f;
@@ -426,7 +494,7 @@ static float arr_max(const float* arr, int n) {
 }
 
 static float median_of(float* arr, int n) {
-    
+    // insertion sort — n is small in practice
     for (int i = 1; i < n; i++) {
         float key = arr[i];
         int   j   = i - 1;
@@ -440,10 +508,13 @@ static float median_of(float* arr, int n) {
     return arr[n / 2];
 }
 
+// ============================================================================
+//  EXTRACT FEATURES  (direct translation of Python extract_features())
+// ============================================================================
 static Features extract_features() {
     int n = BSAD_WINDOW;
 
-    
+    // Unroll circular buffer into flat chronological arrays
     for (int i = 0; i < n; i++) {
         int idx  = (bsad_buf_head + i) % BSAD_WINDOW;
         _t[i]   = bsad_buf[idx].throttle_pct;
@@ -453,7 +524,7 @@ static Features extract_features() {
         _tmp[i] = bsad_buf[idx].temp_C;
     }
 
-    
+    // accel = diff(s) / dt  [km/h per s]
     int n_accel = n - 1;
     int n_pos   = 0;
     for (int i = 0; i < n_accel; i++) {
@@ -461,28 +532,28 @@ static Features extract_features() {
         if (_accel[i] > 0.0f) _accel_pos[n_pos++] = _accel[i];
     }
 
-    
+    // throttle_transitions = count( |diff(t)| > 10 )
     float transitions = 0.0f;
     for (int i = 0; i < n - 1; i++)
         if (fabsf(_t[i + 1] - _t[i]) > 10.0f) transitions += 1.0f;
 
-    
+    // accel_above3_pct = mean(accel > 3) * 100
     float accel_above3 = 0.0f;
     for (int i = 0; i < n_accel; i++)
         if (_accel[i] > 3.0f) accel_above3 += 1.0f;
     accel_above3 = (accel_above3 / (float)n_accel) * 100.0f;
 
-    
+    // speed_above60_pct
     float spd60 = 0.0f;
     for (int i = 0; i < n; i++) if (_s[i] > 60.0f) spd60 += 1.0f;
     spd60 = (spd60 / (float)n) * 100.0f;
 
-    
+    // throttle_above80_pct
     float thr80 = 0.0f;
     for (int i = 0; i < n; i++) if (_t[i] > 80.0f) thr80 += 1.0f;
     thr80 = (thr80 / (float)n) * 100.0f;
 
-    
+    // zero_throttle_frac
     float ztf = 0.0f;
     for (int i = 0; i < n; i++) if (_t[i] < 5.0f) ztf += 1.0f;
     ztf = (ztf / (float)n) * 100.0f;
@@ -510,6 +581,9 @@ static Features extract_features() {
     return f;
 }
 
+// ============================================================================
+//  DIAGNOSE WINDOW  (direct translation of Python diagnose_window())
+// ============================================================================
 static void diagnose_window(const Features& f, float& score_AA, float& score_SHS) {
     score_AA  = 0.0f;
     score_SHS = 0.0f;
@@ -520,57 +594,61 @@ static void diagnose_window(const Features& f, float& score_AA, float& score_SHS
     float amp     = f.accel_mean_pos;
     float ae      = f.accel_efficiency;
 
-    
-    if      (thr_std < 1.5f) score_SHS += 3.0f;
+    // SHS Rules (max 16 pts)
+    if      (thr_std < 1.5f) score_SHS += 3.0f; //throttle std deviation
     else if (thr_std < 3.0f) score_SHS += 2.0f;
 
-    float spd60 = f.speed_above60_pct;
+    float spd60 = f.speed_above60_pct;//the time above speed 60kmph
     if      (spd60 > 50.0f) score_SHS += 3.0f;
     else if (spd60 > 25.0f) score_SHS += 2.0f;
     else if (spd60 > 10.0f) score_SHS += 1.0f;
 
-    float thr80 = f.throttle_above80_pct;
+    float thr80 = f.throttle_above80_pct;//time above throttle 80%
     if      (thr80 > 50.0f) score_SHS += 3.0f;
     else if (thr80 > 20.0f) score_SHS += 2.0f;
     else if (thr80 > 10.0f) score_SHS += 1.0f;
 
-    if      (amp < 0.3f) score_SHS += 3.0f;
+    if      (amp < 0.3f) score_SHS += 3.0f;//Acceleration amplitude
     else if (amp < 0.8f) score_SHS += 2.0f;
     else if (amp < 1.5f) score_SHS += 1.0f;
 
-    float ps = f.power_std;
+    float ps = f.power_std;//power variation
     if      (ps < 150.0f) score_SHS += 3.0f;
     else if (ps < 400.0f) score_SHS += 2.0f;
     else if (ps < 800.0f) score_SHS += 1.0f;
 
-    if (f.zero_throttle_frac < 2.0f) score_SHS += 1.0f;
+    if (f.zero_throttle_frac < 2.0f) score_SHS += 1.0f;//time of zero throttle
 
-    
-    float a3 = f.accel_above3_pct;
+    // AA Rules (max 15 pts)
+    float a3 = f.accel_above3_pct;//% of time of acceleration >3km/s
     if      (a3 > 15.0f) score_AA += 3.0f;
     else if (a3 >  7.0f) score_AA += 2.0f;
     else if (a3 >  2.0f) score_AA += 1.0f;
 
-    if      (ae > 10.0f)  score_AA += 3.0f;
+    if      (ae > 10.0f)  score_AA += 3.0f;//Acceleration > 3% / total transition
     else if (ae >  4.0f)  score_AA += 2.0f;
     else if (ae >  1.5f)  score_AA += 1.0f;
 
-    float cs = f.current_std;
+    float cs = f.current_std;// current spike std deviation
     if      (cs > 35.0f) score_AA += 3.0f;
     else if (cs > 20.0f) score_AA += 2.0f;
     else if (cs > 10.0f) score_AA += 1.0f;
 
-    float pc = f.peak_current;
+    float pc = f.peak_current;// peak current in the time window
     if      (pc > 90.0f) score_AA += 3.0f;
     else if (pc > 70.0f) score_AA += 2.0f;
     else if (pc > 50.0f) score_AA += 1.0f;
 
-    if      (amp > 2.5f) score_AA += 2.0f;
+    if      (amp > 2.5f) score_AA += 2.0f;// avg positive acceleration
     else if (amp > 1.5f) score_AA += 1.0f;
 
-    if (f.on_off_score < 1.0f) score_AA += 1.0f;
+    if (f.on_off_score < 1.0f) score_AA += 1.0f;//throttle pattern  0-1
 }
 
+// ============================================================================
+//  GENERATE 5-MINUTE BSAD REPORT
+//  (direct translation of BatteryStressDiagnoser._generate_report())
+// ============================================================================
 static void generate_bsad_report() {
     float total = cumulative_AA + cumulative_SHS;
     if (total == 0.0f) return;
@@ -589,13 +667,16 @@ static void generate_bsad_report() {
     bsad_ready = true;
 }
 
+// ============================================================================
+//  EVALUATE PAYLOAD  (direct translation of PayloadEstimator._evaluate())
+// ============================================================================
 static void evaluate_payload() {
     if (ss_count < 10) {
         payload_ready = true;
         return;
     }
 
-    
+    // Copy to temp buffers — median_of sorts in place
     static float tmp_I[SS_BUF_MAX];
     static float tmp_v[SS_BUF_MAX];
     int n = (ss_count < SS_BUF_MAX) ? ss_count : SS_BUF_MAX;
@@ -627,6 +708,10 @@ static void evaluate_payload() {
     payload_ready = true;
 }
 
+// ============================================================================
+//  PRINT COMBINED 5-MINUTE RESULT
+//  (mirrors Python IQubeApp._update_combined_result_ui())
+// ============================================================================
 static void print_combined_result(float temp_rise) {
     Serial.println(F("========== 5-MINUTE DIAGNOSIS REPORT =========="));
     Serial.print(F("AA  confidence : ")); Serial.print(last_AA_conf,  1); Serial.println('%');
@@ -669,11 +754,14 @@ static void print_combined_result(float temp_rise) {
     Serial.println(F("================================================"));
 }
 
+// ============================================================================
+//  DIAGNOSER FEED — called once per sim tick with current sim outputs
+// ============================================================================
 static void diagnoser_feed(float throttle_pct, float speed_kmh,
                             float current_A,    float power_W,
                             float temp_C) {
 
-    
+    // Store in circular BSAD buffer
     int write_idx = (bsad_buf_head + bsad_buf_count) % BSAD_WINDOW;
     if (bsad_buf_count < BSAD_WINDOW) {
         bsad_buf_count++;
@@ -687,7 +775,7 @@ static void diagnoser_feed(float throttle_pct, float speed_kmh,
     bsad_buf[write_idx].power_W      = power_W;
     bsad_buf[write_idx].temp_C       = temp_C;
 
-    
+    // Process non-overlapping 1-minute window
     bsad_sample_in_window++;
     if (bsad_sample_in_window >= BSAD_WINDOW) {
         Features f = extract_features();
@@ -715,7 +803,7 @@ static void payload_feed(float I_pack, float v_ms, float acc, float temp_C) {
     if (temp_window_start < 0.0f) temp_window_start = temp_C;
     temp_window_end = temp_C;
 
-    
+    // Steady-state: abs(acc) < 0.05 AND v > 8 m/s AND I > 0
     if (fabsf(acc) < 0.05f && v_ms > 8.0f && I_pack > 0.0f) {
         if (ss_count < SS_BUF_MAX) {
             ss_I_buf[ss_count] = I_pack;
@@ -741,6 +829,9 @@ static void payload_feed(float I_pack, float v_ms, float acc, float temp_C) {
     }
 }
 
+// ============================================================================
+//  SETUP
+// ============================================================================
 void setup() {
     Serial.begin(115200);
     delay(500);
@@ -755,6 +846,9 @@ void setup() {
     Serial.println(F("Simulation started. Diagnosis report every 5 minutes."));
 }
 
+// ============================================================================
+//  LOOP  — one 100 ms tick per iteration (unchanged timing from original)
+// ============================================================================
 unsigned long last_tick_ms = 0;
 
 void loop() {
@@ -762,16 +856,16 @@ void loop() {
     if ((now - last_tick_ms) < (unsigned long)(TS * 1000.0f)) return;
     last_tick_ms = now;
 
-    
+    // Read potentiometers (unchanged)
     float throttle = read_throttle();
     float load     = read_load();
     float T_amb    = read_tamb();
     bool  eco_mode = false;
 
-    
+    // Simulation step (unchanged)
     sim_step(throttle, T_amb, load, eco_mode);
 
-    
+    // Serial print (unchanged)
     Serial.println(F("-----------------------------"));
     Serial.print(F("Throttle      : ")); Serial.print(throttle,           2); Serial.print(F("% "));
     Serial.print(F(" Rider Load   : ")); Serial.print(load,               2); Serial.print(F("kg "));
@@ -785,7 +879,7 @@ void loop() {
     Serial.print(F(" Regen Active : ")); Serial.println(sim.regen_active ? F("YES") : F("NO"));
     Serial.println(F("-----------------------------"));
 
-    
+    // Feed diagnoser
     diagnoser_feed(throttle,
                    sim.v_ms * 3.6f,
                    sim.I_pack,
@@ -797,7 +891,7 @@ void loop() {
                  sim.acc,
                  sim.T_bat);
 
-    
+    // Battery depletion halt (unchanged)
     if (sim.SOC <= 0.001f) {
         Serial.println(F("# Battery depleted — simulation halted."));
         while (true) delay(1000);
